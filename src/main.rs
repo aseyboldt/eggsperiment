@@ -6,6 +6,7 @@ use smallvec::SmallVec;
 
 #[derive(Debug)]
 struct NodeDB {
+    /// Store python objects in something like this?
     names: HashMap<u32, String>,
 }
 
@@ -14,13 +15,14 @@ struct NodeDB {
 pub struct SimpleNode {
     db: Rc<NodeDB>,
     node_id: u32,
-    parents: SmallVec<[Id; 8]>,
+    /// The inputs of the node
+    children: SmallVec<[Id; 4]>,
 }
 
 impl PartialEq for SimpleNode {
     fn eq(&self, other: &Self) -> bool {
         assert!(Rc::ptr_eq(&self.db, &other.db));
-        self.node_id == other.node_id && self.parents == other.parents
+        self.node_id == other.node_id && self.children == other.children
     }
 }
 
@@ -33,7 +35,7 @@ impl PartialOrd for SimpleNode {
             Some(core::cmp::Ordering::Equal) => {}
             ord => return ord,
         }
-        self.parents.partial_cmp(&other.parents)
+        self.children.partial_cmp(&other.children)
     }
 }
 
@@ -45,54 +47,108 @@ impl Ord for SimpleNode {
             core::cmp::Ordering::Equal => {}
             ord => return ord,
         }
-        self.parents.cmp(&other.parents)
+        self.children.cmp(&other.children)
     }
 }
 
 impl Hash for SimpleNode {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.node_id.hash(state);
-        self.parents.hash(state);
+        self.children.hash(state);
     }
 }
 
 
-struct Variable {
-    idx: u16,
-    owner: Id,
+enum ScalarType {
+    Float64,
+    Float32,
+    UInt32,
+    Int32,
 }
+
+
+struct Dim {
+    size_hint: usize,
+}
+
+type Dims = SmallVec<[Dim; 2]>;
+
+
+enum Type {
+    DenseTensor(ScalarType, Dims),
+    Scalar(ScalarType),
+}
+
+
+struct BufferedVariable {
+    /// First is the buffer, second the source of the state (ie the owner node).
+    /// TODO state source could be None
+    children: [Id; 2],
+    value_type: Type,
+}
+
+
+struct UnbufferedVariable {
+    owner: Option<Id>,
+    value_type: Type,
+}
+
+
+enum Variable {
+    Buffered(BufferedVariable),
+    Unbuffered(UnbufferedVariable),
+}
+
+
+struct Buffer {}
 
 
 struct Elemwise {
     /// first n_inputs should be `Node::Argument`, remaining
     /// n_outputs should be `Node::Output`.
-    all_inputs: SmallVec<[Id, 8]>,
+    children: SmallVec<[Id; 8]>,
     n_inputs: u64,
-    n_outputs: u64,
+    // TODO inplace_map
+}
+
+
+struct IfElse {
+    /// The first child is the condition, then we have `n_inputs`
+    /// input children, and another `n_input` output children.
+    children: SmallVec<[Id; 8]>,
+    n_inputs: usize,
+}
+
+
+enum Node {
+    /// A node in the pytensor sense, that doesn't have an inner fgraph
+    Simple(SimpleNode),
+    /// A elemwise node, that needs to also store the scalar fgraph.
+    /// The children should be the inputs to the scalar fgraph (as
+    /// `Node::Argument`), and the outputs as `Node::Variable`.
+    Elemwise(Elemwise),
+    /// Should contain two grahps, one for the if and one for
+    /// the else, and a variable for the condition.
+    IfElse(IfElse),
 }
 
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Node {
-    /// A node in the pytensor sense, that doesn't have an inner fgraph
-    SimpleNode(SimpleNode),
+pub enum ENode {
+    Node(Node),
 
-    /// A elemwise node, that needs to also store the scalar fgraph.
-    /// The children should be the inputs to the scalar fgraph (as
-    /// `Node::Argument`), and the outputs as `Node::Variable`.
-    Elemwise(SimpleNode),
+    Output(usize, Variable),
+    Argument(usize, Variable),
 
-    /// Should contain two grahps, one for the if and one for
-    /// the else, and a variable for the condition.
-    IfElse(IfElse),
-    Output(Variable),
-    Argument(Variable),
+    Buffer(Buffer),
+    Constant(),
 }
 
 
-impl Language for Node {
+impl Language for ENode {
+    // TODO update
     fn matches(&self, other: &Self) -> bool {
-        use Node::*;
+        use ENode::*;
         match (self, other) {
             (SimpleNode(_), Variable(_)) => false,
             (Variable(_), SimpleNode(_)) => false,
@@ -102,7 +158,7 @@ impl Language for Node {
     }
 
     fn children(&self) -> &[Id] {
-        use Node::*;
+        use ENode::*;
         match self {
             Variable(id) => from_ref(id),
             SimpleNode(node) => &node.parents
@@ -110,7 +166,7 @@ impl Language for Node {
     }
 
     fn children_mut(&mut self) -> &mut [Id] {
-        use Node::*;
+        use ENode::*;
         match self {
             Variable(id) => from_mut(id),
             SimpleNode(node) => &mut node.parents
